@@ -20,6 +20,12 @@ import type { Context } from '@cyanheads/mcp-ts-core';
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getObsidianService, type ObsidianService } from '@/services/obsidian/obsidian-service.js';
+import {
+  classifyPath,
+  federatedListNotes,
+  federationError,
+  withVaultPrefix,
+} from './_shared/federation-bridge.js';
 
 const DEFAULT_DEPTH = 2;
 const MAX_DEPTH = 20;
@@ -167,6 +173,52 @@ export const obsidianListNotes = tool('obsidian_list_notes', {
         ? input.extension.toLowerCase()
         : `.${input.extension.toLowerCase()}`
       : undefined;
+
+    // ── Federation interception ──────────────────────────────────────────
+    // When `path` carries a `<vault>:<rel>` prefix and the vault is NOT the
+    // self-vault, walk the directory on disk and return entries with the
+    // vault prefix preserved. Self-vault prefix → strip and continue via REST.
+    if (input.path !== undefined && input.path !== '') {
+      const cls = classifyPath(input.path);
+      if (cls.kind === 'error') throw federationError(cls.error);
+      if (cls.kind === 'self') {
+        input = { ...input, path: cls.relPath };
+      } else if (cls.kind === 'federated') {
+        const { resolved } = cls;
+        const { entries, cappedByEntries } = await federatedListNotes(resolved, {
+          depth,
+          extension: ext,
+          nameRegex: regex,
+          entryCap: ENTRY_CAP,
+        });
+        // Re-prefix entries with the vault name so subsequent get_note calls
+        // routed through `<vault>:<entry>` keep working transparently.
+        const prefixed = entries.map((e) => ({
+          path: withVaultPrefix(resolved.vault.name, e.path),
+          type: e.type,
+        }));
+        const totalFiles = entries.filter((e) => e.type === 'file').length;
+        const totalDirs = entries.filter((e) => e.type === 'directory').length;
+        const appliedFilters: { extension?: string; nameRegex?: string; depth: number } = {
+          depth,
+        };
+        if (ext) appliedFilters.extension = ext;
+        if (input.nameRegex) appliedFilters.nameRegex = input.nameRegex;
+        return {
+          path: withVaultPrefix(resolved.vault.name, resolved.relPath),
+          entries: prefixed,
+          totals: {
+            entries: prefixed.length,
+            files: totalFiles,
+            directories: totalDirs,
+          },
+          appliedFilters,
+          ...(cappedByEntries
+            ? { excluded: { reason: 'entry_cap' as const, cap: ENTRY_CAP, hint: ENTRY_CAP_HINT } }
+            : {}),
+        };
+      }
+    }
 
     const rootDir = (input.path ?? '').replace(/^\/+|\/+$/g, '');
     const state: WalkState = { entries: [], totalFiles: 0, totalDirs: 0, cappedByEntries: false };

@@ -5,9 +5,16 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, validationError } from '@cyanheads/mcp-ts-core/errors';
 import { getObsidianService } from '@/services/obsidian/obsidian-service.js';
 import { extractSection } from '@/services/obsidian/section-extractor.js';
+import {
+  classifyPath,
+  federatedGetContent,
+  federatedGetJson,
+  federationError,
+  withVaultPrefix,
+} from './_shared/federation-bridge.js';
 import { SectionSchema, TargetSchema } from './_shared/schemas.js';
 import { withCaseFallback } from './_shared/suggest-paths.js';
 
@@ -155,7 +162,52 @@ export const obsidianGetNote = tool('obsidian_get_note', {
 
   async handler(input, ctx) {
     const svc = getObsidianService();
-    const { target } = input;
+    let { target } = input;
+
+    // ── Federation interception ──────────────────────────────────────────
+    // When the target is a path with a `<vault>:<rel>` prefix and the vault
+    // is NOT the self-vault, route to the filesystem-direct reader. Self-
+    // vault prefix → strip and continue via REST API as usual.
+    // document-map and section formats are not supported on federated reads
+    // (they require Obsidian's parsed projections); reject with a clear
+    // validation error so callers know to switch format.
+    if (target.type === 'path') {
+      const cls = classifyPath(target.path);
+      if (cls.kind === 'error') throw federationError(cls.error);
+      if (cls.kind === 'self') {
+        target = { type: 'path', path: cls.relPath };
+      } else if (cls.kind === 'federated') {
+        const { resolved } = cls;
+        const displayPath = withVaultPrefix(resolved.vault.name, resolved.relPath);
+        if (input.format === 'content') {
+          const content = await federatedGetContent(resolved);
+          return { result: { format: 'content' as const, path: displayPath, content } };
+        }
+        if (input.format === 'full') {
+          const note = await federatedGetJson(resolved);
+          return {
+            result: {
+              format: 'full' as const,
+              path: displayPath,
+              content: note.content,
+              frontmatter: note.frontmatter,
+              tags: note.tags,
+              stat: note.stat,
+              ...(input.includeLinks ? { outgoingLinks: parseOutgoingLinks(note.content) } : {}),
+            },
+          };
+        }
+        // document-map / section require Obsidian's parsing pipeline.
+        throw validationError(
+          `Format '${input.format}' is not supported for cross-vault reads (vault '${resolved.vault.name}'). Use format 'content' or 'full'.`,
+          {
+            reason: 'federation_format_unsupported',
+            vault: resolved.vault.name,
+            format: input.format,
+          },
+        );
+      }
+    }
 
     if (input.format === 'content') {
       if (target.type === 'path') {
