@@ -1,9 +1,13 @@
 <div align="center">
-  <h1>obsidian-mcp-server</h1>
+  <h1>obsidian-mcp-server-federated</h1>
+  <p><b>Fork of <a href="https://github.com/cyanheads/obsidian-mcp-server">cyanheads/obsidian-mcp-server</a> with cross-vault federation: route prefixed wikilinks (<code>[[other-vault:path/to/note]]</code>) to filesystem reads against sibling vaults declared in <code>_federation/vaults.json</code>.</b></p>
   <p><b>MCP server for Obsidian vaults — read, write, search, and surgically edit notes, tags, and frontmatter via the Local REST API plugin. STDIO or Streamable HTTP.</b>
   <div>14 Tools • 3 Resources</div>
   </p>
 </div>
+
+> **Federation extension** (this fork): see [Cross-vault federation](#cross-vault-federation) below.
+> Upstream is unchanged; cross-vault routing kicks in only when `OBSIDIAN_FEDERATION_REGISTRY` is set.
 
 <div align="center">
 
@@ -148,6 +152,60 @@ Denies are typed `path_forbidden` (JSON-RPC code `Forbidden`) with the active sc
 The startup banner logs the active scope so operators can verify their config at boot.
 
 ---
+
+## Cross-vault federation
+
+> Available in the `obsidian-mcp-server-federated` fork only.
+
+When `OBSIDIAN_FEDERATION_REGISTRY` is set to the path of a `_federation/vaults.json` registry file, the read tools transparently route prefixed paths to sibling vaults on disk:
+
+```
+obsidian_get_note   target.path = "denis-personal:projects/notes.md"
+obsidian_list_notes path        = "denis-personal:projects"
+```
+
+Routing rules:
+
+- **No prefix** (`projects/notes.md`) → unchanged, served via the Local REST API against the self-vault.
+- **`<self-vault>:<path>`** → prefix is stripped and the call routes via REST API as usual (a documentation convenience).
+- **`<other-vault>:<path>`** → resolved to an absolute filesystem path under the other vault's declared `path`, and the note/listing is read directly from disk. The Local REST API plugin is single-vault per process, so cross-vault reads bypass it.
+- **Sensitive vaults** (`kind: "sensitive"`) → cross-vault reads are blocked at the resolver. Only the self-vault server can read them.
+- **Writes are never federated** — every write tool keeps targeting the self-vault via REST API. Cross-vault writes would need per-vault REST endpoints, which the registry does not declare.
+
+Federated reads currently support `format: "content"` and `format: "full"` on `obsidian_get_note`. The `document-map` and `section` projections require Obsidian's parsing pipeline and remain self-vault-only.
+
+### Registry shape
+
+```json
+{
+  "schema_version": "1.0",
+  "vault_self": { "name": "owner-personal" },
+  "vaults": [
+    { "name": "owner-personal", "kind": "open", "path": "C:\\Users\\me\\vaults\\owner" },
+    { "name": "denis-personal", "kind": "open", "path": "C:\\Users\\me\\vaults\\denis" },
+    { "name": "owner-sensitive", "kind": "sensitive", "path": "..." }
+  ]
+}
+```
+
+Extra fields per vault are tolerated (forward-compat with future schema bumps). Vaults without a local `path` are treated as remote-only — cross-vault reads against them throw `vault_unavailable`.
+
+### Configuration
+
+| Env var | Default | Description |
+|---|---|---|
+| `OBSIDIAN_FEDERATION_REGISTRY` | unset | Absolute path to the `_federation/vaults.json` file. Unset disables federation entirely (the server behaves identically to upstream). |
+
+The registry is loaded once on first access and cached for the process lifetime. Restart the server to pick up registry changes.
+
+### Path security
+
+Cross-vault paths are validated before any filesystem access:
+
+- Absolute paths (POSIX `/etc/...` or Windows `C:\\...`) are rejected.
+- `..` traversal segments are rejected.
+- After `path.resolve`, the candidate must stay under the vault root — otherwise `path_escape` is thrown.
+- Hidden files (dotfiles, `.git/`, `.obsidian/`) are skipped during directory listings.
 
 ## Resources
 
